@@ -17,7 +17,7 @@ import (
 
 // The agent of job server.
 type agent struct {
-	sync.Mutex
+	sync.RWMutex
 	reconnectState    uint32
 	conn              net.Conn
 	connectionVersion uint32
@@ -104,6 +104,7 @@ func (a *agent) work() {
 }
 
 func (a *agent) reconnectError(err error) {
+	a.RLock()
 	if a.conn != nil {
 		err = &WorkerDisconnectError{
 			err:   err,
@@ -111,6 +112,7 @@ func (a *agent) reconnectError(err error) {
 		}
 		a.worker.err(err)
 	}
+	a.RUnlock()
 	a.Connect()
 }
 
@@ -118,6 +120,7 @@ func (a *agent) Close() {
 	if a.conn == nil {
 		return
 	}
+
 	a.Lock()
 	defer a.Unlock()
 	if a.conn != nil {
@@ -127,9 +130,12 @@ func (a *agent) Close() {
 }
 
 func (a *agent) Grab() (err error) {
+	a.RLock()
 	if a.conn == nil {
 		return errors.New("No connection")
 	}
+	a.RUnlock()
+
 	return a.grab()
 }
 
@@ -140,9 +146,12 @@ func (a *agent) grab() error {
 }
 
 func (a *agent) PreSleep() (err error) {
+	a.RLock()
 	if a.conn == nil {
 		return errors.New("No connection")
 	}
+	a.RUnlock()
+
 	outpack := getOutPack()
 	outpack.dataType = rt.PT_PreSleep
 	return a.Write(outpack)
@@ -175,10 +184,12 @@ func (a *agent) Connect() {
 	for !a.worker.isShuttingDown() {
 		for numTries := 1; !a.worker.isShuttingDown(); numTries++ {
 
+			a.Lock()
 			if a.conn != nil {
 				_ = a.conn.Close()
 				a.conn = nil
 			}
+			a.Lock()
 
 			// nil-out the rw pointer since it's no longer valid
 			_ = atomic.SwapPointer((*unsafe.Pointer)(unsafe.Pointer(&a.rw)), nil)
@@ -212,7 +223,9 @@ func (a *agent) Connect() {
 			continue
 		}
 
+		a.Lock()
 		a.conn = conn
+		a.Unlock()
 		a.connectionVersion++
 
 		a.worker.Log(Info, "Successfully Connected to:", a.addr)

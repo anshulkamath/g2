@@ -213,7 +213,7 @@ func (se *session) handleAdminConnection(s *Server, conn net.Conn, r *bufio.Read
 			for fnName, v := range s.funcWorker {
 				runningCnt := 0
 				for _, j := range s.jobs {
-					if fnName == j.FuncName && j.Running {
+					if fnName == j.FuncName && j.Running.Load() {
 						runningCnt++
 					}
 				}
@@ -228,7 +228,7 @@ func (se *session) handleAdminConnection(s *Server, conn net.Conn, r *bufio.Read
 				normal := 0
 				low := 0
 				for _, j := range s.jobs {
-					if fnName == j.FuncName && !j.Running {
+					if fnName == j.FuncName && !j.Running.Load() {
 						switch j.Priority {
 						case JobHigh:
 							high++

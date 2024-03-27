@@ -14,13 +14,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/appscode/go/log"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/quantcast/g2/pkg/metrics"
 	. "github.com/quantcast/g2/pkg/runtime"
 	"github.com/quantcast/g2/pkg/storage"
 	"github.com/quantcast/g2/pkg/storage/leveldb"
-	"github.com/appscode/go/log"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	lberror "github.com/syndtr/goleveldb/leveldb/errors"
 	"gopkg.in/robfig/cron.v2"
 )
@@ -45,7 +45,8 @@ type Server struct {
 	forwardReport  int64
 	cronSvc        *cron.Cron
 	cronJobs       map[string]*CronJob
-	mu             *sync.RWMutex
+	cronMu         *sync.RWMutex
+	jobMu          *sync.RWMutex
 }
 
 var ( //const replys, to avoid building it every time
@@ -65,7 +66,8 @@ func NewServer(cfg Config) *Server {
 		opCounter:  make(map[PT]int64),
 		cronSvc:    cron.New(),
 		cronJobs:   make(map[string]*CronJob),
-		mu:         &sync.RWMutex{},
+		cronMu:     &sync.RWMutex{},
+		jobMu:      &sync.RWMutex{},
 	}
 
 	// Initiate data storage
@@ -94,8 +96,8 @@ func (s *Server) loadAllJobs() {
 			log.Errorln("invalid job")
 			continue
 		}
-		j.ProcessBy = 0 //no body handle it now
-		j.CreateBy = 0  //clear
+		atomic.StoreInt64(&j.ProcessBy, 0) //no body handle it now
+		atomic.StoreInt64(&j.CreateBy, 0) //clear
 		log.Debugf("handle: %v\tfunc: %v\tis_background: %v", j.Handle, j.FuncName, j.IsBackGround)
 		s.doAddJob(j)
 	}
@@ -225,9 +227,13 @@ func (s *Server) add2JobWorkerQueue(j *Job) {
 }
 
 func (s *Server) doAddJob(j *Job) {
+	s.jobMu.Lock()
+	s.jobs[j.Handle] = j
+	s.jobMu.Unlock()
+
 	j.ProcessBy = 0 //nobody handle it right now
 	s.add2JobWorkerQueue(j)
-	s.jobs[j.Handle] = j
+
 	s.wakeupWorker(j.FuncName)
 	if cron, ok := s.getCronJobFromMap(j.CronHandle); ok {
 		cron.Created++
@@ -313,9 +319,10 @@ func (s *Server) popJob(sessionId int64) (j *Job) {
 			for it := wj.jobs.Front(); it != nil; it = it.Next() {
 				jtmp := it.Value.(*Job)
 				//Don't return running job. This case arise when server restarted but some job still executing
-				if jtmp.Running {
+				if jtmp.Running.Load() {
 					continue
 				}
+
 				j = jtmp
 				wj.jobs.Remove(it)
 				return
@@ -334,7 +341,7 @@ func (s *Server) wakeupWorker(funcName string) bool {
 	var allRunning = true
 	for it := wj.jobs.Front(); it != nil; it = it.Next() {
 		j := it.Value.(*Job)
-		if !j.Running {
+		if !j.Running.Load() {
 			allRunning = false
 			break
 		}
@@ -358,11 +365,16 @@ func (s *Server) wakeupWorker(funcName string) bool {
 }
 
 func (s *Server) removeJob(j *Job, isSuccess bool) {
+	s.jobMu.Lock()
 	delete(s.jobs, j.Handle)
+	s.jobMu.Unlock()
+
 	if pw, found := s.worker[j.ProcessBy]; found {
 		delete(pw.runningJobs, j.Handle)
 	}
+
 	log.Debugf("job removed: %v", j.Handle)
+
 	if j.IsBackGround {
 		if cron, ok := s.getCronJobFromMap(j.CronHandle); ok {
 			if isSuccess {
@@ -471,9 +483,12 @@ func (s *Server) handleGetJob(e *event) (err error) {
 
 	if len(e.handle) == 0 {
 		jobs := []*Job{}
+		s.jobMu.RLock()
 		for _, v := range s.jobs {
 			jobs = append(jobs, v)
 		}
+		s.jobMu.RUnlock()
+
 		buf, err = json.Marshal(jobs)
 		if err != nil {
 			log.Error(err)
@@ -481,6 +496,9 @@ func (s *Server) handleGetJob(e *event) (err error) {
 		}
 		return nil
 	}
+
+	s.jobMu.RLock()
+	defer s.jobMu.RUnlock()
 
 	if job, ok := s.jobs[e.handle]; ok {
 		buf, err = json.Marshal(job)
@@ -504,11 +522,11 @@ func (s *Server) handleGetCronJob(e *event) (err error) {
 	if len(e.handle) == 0 {
 		var cjs []*CronJob = make([]*CronJob, 0)
 
-		s.mu.RLock()
+		s.cronMu.RLock()
 		for _, v := range s.cronJobs {
 			cjs = append(cjs, v)
 		}
-		s.mu.RUnlock()
+		s.cronMu.RUnlock()
 
 		buf, err = json.Marshal(cjs)
 		if err != nil {
@@ -640,8 +658,10 @@ func (s *Server) handleWorkReport(e *event) {
 
 	j, ok := s.getRunningJobByHandle(jobhandle)
 	if !ok {
+		s.jobMu.RLock()
 		log.Warningf("job information lost, %v job handle %v, %+v",
 			e.tp, jobhandle, s.jobs)
+		s.jobMu.RUnlock()
 		return
 	}
 
@@ -733,10 +753,9 @@ func (s *Server) handleProtoEvt(e *event) {
 			j.ProcessBy = sessionId
 			j.TimeoutSec = w.canDo[j.FuncName]
 			//track this job
-			j.Running = true
+			j.Running.Store(true)
 			w.runningJobs[j.Handle] = j
 			s.saveJobInDB(j)
-
 		} else { //no job
 			w.status = wsPrepareForSleep
 		}
@@ -767,8 +786,13 @@ func (s *Server) handleProtoEvt(e *event) {
 		s.handleSubmitEpochJob(e)
 	case PT_GetStatus:
 		jobhandle := bytes2str(args.t0)
-		if job, ok := s.jobs[jobhandle]; ok {
-			e.result <- &Tuple{t0: args.t0, t1: true, t2: job.Running,
+
+		s.jobMu.RLock()
+		job, ok := s.jobs[jobhandle]
+		s.jobMu.RUnlock()
+
+		if ok {
+			e.result <- &Tuple{t0: args.t0, t1: true, t2: job.Running.Load(),
 				t3: job.Percent, t4: job.Denominator}
 			break
 		}
@@ -810,7 +834,7 @@ func (s *Server) WatcherLoop() {
 			rep := 0
 			one := 0
 
-			s.mu.RLock()
+			s.cronMu.RLock()
 			cLen := len(s.cronJobs)
 			for _, cj := range s.cronJobs {
 				if _, isOne := s.ExpressionToEpoch(cj.Expression); isOne {
@@ -819,27 +843,33 @@ func (s *Server) WatcherLoop() {
 					rep++
 				}
 			}
-			s.mu.RUnlock()
+			s.cronMu.RUnlock()
 
 			log.Infof("total cron job: %v #repeated job: %v #onetime job: %v", cLen, rep, one)
 			var b, r int = 0, 0
+
+			s.jobMu.RLock()
+			jobLen := len(s.jobs)
 			for _, j := range s.jobs {
 				if j.IsBackGround {
 					b++
 				}
-				if j.Running {
+				if j.Running.Load() {
 					r++
 				}
 			}
-			log.Infof("total job: %v #background: %v #running: %v", len(s.jobs), b, r)
+			s.jobMu.RUnlock()
+
+			log.Infof("total job: %v #background: %v #running: %v", jobLen, b, r)
 		}
 	}
 }
 
 func (s *Server) WatchJobTimeout() {
 	for range time.NewTicker(time.Second).C {
+		s.jobMu.RLock()
 		for _, job := range s.jobs {
-			if !job.Running {
+			if !job.Running.Load() {
 				continue
 			}
 			if time.Now().Sub(job.ProcessAt) > time.Duration(job.TimeoutSec)*time.Second {
@@ -857,8 +887,8 @@ func (s *Server) WatchJobTimeout() {
 				sendTimeoutException(c.in, job.Handle, "timeout expired")
 				s.forwardReport++
 			}
-
 		}
+		s.jobMu.RUnlock()
 	}
 }
 
@@ -898,8 +928,11 @@ func (s *Server) isWorker(sessionId int64) bool {
 }
 
 func (s *Server) getRunningJobByHandle(handle string) (*Job, bool) {
+	s.jobMu.RLock()
+	defer s.jobMu.RUnlock()
+
 	for _, j := range s.jobs {
-		if j.Handle == handle && j.Running {
+		if j.Handle == handle && j.Running.Load() {
 			return j, true
 		}
 	}
@@ -916,9 +949,9 @@ func (s *Server) isClient(sessionId int64) bool {
 }
 
 func (s *Server) addCronJob(cj *CronJob) {
-	s.mu.Lock()
+	s.cronMu.Lock()
 	s.cronJobs[cj.Handle] = cj
-	s.mu.Unlock()
+	s.cronMu.Unlock()
 
 	if s.store != nil {
 		err := s.store.Add(cj)
@@ -938,9 +971,9 @@ func (s *Server) saveJobInDB(j *Job) {
 }
 
 func (s *Server) removeCronJob(cj *CronJob) error {
-	s.mu.Lock()
+	s.cronMu.Lock()
 	delete(s.cronJobs, cj.Handle)
-	s.mu.Unlock()
+	s.cronMu.Unlock()
 
 	if s.store != nil {
 		err := s.store.Delete(cj)
@@ -956,8 +989,8 @@ func (s *Server) removeCronJob(cj *CronJob) error {
 }
 
 func (s *Server) getCronJobFromMap(handle string) (cronJob *CronJob, ok bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.cronMu.RLock()
+	defer s.cronMu.RUnlock()
 	cronJob, ok = s.cronJobs[handle]
 	return
 }

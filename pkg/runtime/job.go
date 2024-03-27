@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"sync/atomic"
 	"time"
 )
 
@@ -14,21 +15,21 @@ const (
 )
 
 type Job struct {
-	Handle       string    `json:"job_handle,omitempty"` //server job handle
-	Id           string    `json:"id,omitempty"`
-	Data         []byte    `json:"data,omitempty"`
-	Running      bool      `json:"is_running,omitempty"`
-	Percent      int       `json:"percent,omitempty"`
-	Denominator  int       `json:"denominator,omitempty"`
-	CreateAt     time.Time `json:"created_at,omitempty"`
-	ProcessAt    time.Time `json:"process_at,omitempty"`
-	TimeoutSec   int32     `json:"timeout_sec,omitempty"`
-	CreateBy     int64     `json:"created_by,omitempty"` //client sessionId
-	ProcessBy    int64     `json:"process_by,omitempty"` //worker sessionId
-	FuncName     string    `json:"function_name,omitempty"`
-	IsBackGround bool      `json:"is_background_job"`
-	Priority     int       `json:"priority"`
-	CronHandle   string    `json:"cronjob_handle,omitempty"`
+	Handle       string      `json:"job_handle,omitempty"` //server job handle
+	Id           string      `json:"id,omitempty"`
+	Data         []byte      `json:"data,omitempty"`
+	Running      atomic.Bool `json:"is_running,omitempty"`
+	Percent      int         `json:"percent,omitempty"`
+	Denominator  int         `json:"denominator,omitempty"`
+	CreateAt     time.Time   `json:"created_at,omitempty"`
+	ProcessAt    time.Time   `json:"process_at,omitempty"`
+	TimeoutSec   int32       `json:"timeout_sec,omitempty"`
+	CreateBy     int64       `json:"created_by,omitempty"` //client sessionId
+	ProcessBy    int64       `json:"process_by,omitempty"` //worker sessionId
+	FuncName     string      `json:"function_name,omitempty"`
+	IsBackGround bool        `json:"is_background_job"`
+	Priority     int         `json:"priority"`
+	CronHandle   string      `json:"cronjob_handle,omitempty"`
 }
 
 type CronJob struct {
